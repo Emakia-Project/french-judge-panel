@@ -1,0 +1,414 @@
+---
+# Filtering Sets
+# schema: filters/v1
+#
+# Two layers, deliberately separated:
+#   query_layer   -> compiled into X API v2 search/stream queries. No regex, no
+#                    wildcards, no case sensitivity. Costs API quota. Recall tool.
+#   scoring_layer -> applied locally after fetch. Regex, normalization, counts.
+#                    Free. Precision tool. Feeds the LLM panel as features.
+#
+# Nothing here is a verdict. Tier membership is a feature vector handed to the
+# judge panel, never a label. See notes.tier_semantics at the bottom.
+
+version: 1
+schema: filters/v1
+updated: 2026-09-02
+locales: [en, fr]
+
+# ---------------------------------------------------------------------------
+# External lexicons. Slur and profanity vocabulary is NOT inlined in this file.
+# It is fetched from published, versioned, citable sources and cached locally.
+# Rationale: provenance for the paper, maintained French coverage, and no
+# hand-curated slur list living in the repo.
+# ---------------------------------------------------------------------------
+lexicons:
+  hurtlex:
+    cite: "Bassignana, Basile & Patti (2018), HurtLex"
+    url: "https://github.com/valeriobasile/hurtlex"
+    files:
+      en: lexica/EN/1.2/hurtlex_EN.tsv
+      fr: lexica/FR/1.2/hurtlex_FR.tsv
+    # HurtLex ships 17 categories; we consume only these.
+    categories:
+      severe_abuse: [cds, asm, asf, om, or]   # slurs, gendered abuse, animals
+      dehumanization: [ps, rci, an]           # ethnic slurs, dehumanizing nouns
+    conservative_only: true   # use the "conservative" column, drop "inclusive"
+
+  ldnoobw:
+    cite: "Shutterstock, List of Dirty/Naughty/Obscene/Bad Words"
+    url: "https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words"
+    files:
+      en: en
+      fr: fr
+    use: prefilter_only   # profanity != harassment; never scored alone
+
+  mlma:
+    cite: "Ousidhoum et al. (2019), Multilingual and Multi-Aspect Hate Speech"
+    url: "https://github.com/HKUST-KnowComp/MLMA_hate_speech"
+    use: training_data    # not a match lexicon; listed for provenance parity
+
+# ---------------------------------------------------------------------------
+# C1 - High severity
+# ---------------------------------------------------------------------------
+C1:
+  tier: 1
+  severity: high
+  description: Explicit, unambiguous, high-risk harassment signals.
+
+  EXPLICIT_THREAT:
+    # Threats are compositional, not lexical. Query layer casts a wide net on
+    # the harm verbs; scoring layer does the actual structural work.
+    query_layer:
+      en: [kill, murder, shoot, stab, burn, hunt, "find you", "know where you"]
+      fr: [tuer, buter, égorger, brûler, "je sais où", "on va te trouver"]
+    scoring_layer:
+      THREAT_DIRECT:
+        en: '\b(i|we)(\s+\w+){0,3}\s+(will|gonna|going to|ll)\s+(\w+\s+){0,2}(kill|hurt|find|end|destroy|beat|shoot|stab)\s+(you|u|ur|your)\b'
+        fr: '\b(je|on|nous)\s+(vais|va|vais te|te)\s+(\w+\s+){0,2}(tuer|buter|défoncer|retrouver|crever)\b'
+      THREAT_CONDITIONAL:
+        en: '\bif\s+i\s+(ever\s+)?(see|catch|find|meet|run into)\s+(you|u)\b'
+        fr: '\bsi\s+(je\s+te\s+(vois|croise|trouve)|jamais\s+je\s+te)\b'
+      THREAT_LOCATIVE:
+        en: '\b(i|we)\s+know\s+(where|what)\s+(you|u|ur|your)\s+(live|work|go|school|kids)\b'
+        fr: "\\b(je|on)\\s+sait?\\s+(où\\s+tu\\s+(habites|travailles)|ton\\s+adresse)\\b"
+      THREAT_PROXY:
+        en: '\b(some(one|body))\s+(should|needs? to|ought to)\s+(\w+\s+){0,2}(kill|shoot|hurt|silence|end)\b'
+        fr: '\b(quelqu.un)\s+(devrait|doit)\s+(\w+\s+){0,2}(la|le|les)\s+(tuer|faire taire|buter)\b'
+      THREAT_DOXX:
+        en: '\b(post|drop|leak|find|look up|expose)\s+(\w+\s+){0,3}(address|adress|home|employer|workplace|school|plate|number)\b'
+        fr: "\\b(balance|poste|trouve|donne)\\s+(\\w+\\s+){0,3}(adresse|employeur|école|plaque|numéro)\\b"
+      THREAT_COUNTDOWN:
+        en: '\b(you have|t minus|by)\s+(\d+|one|two|three)\s+(hour|day|week)s?\b.{0,60}\b(or|before|then)\b'
+        fr: '\btu\s+as\s+(\d+|un|deux|trois)\s+(heure|jour|semaine)s?\b.{0,60}\b(sinon|avant que)\b'
+    weight: 1.0
+
+  SEVERE_ABUSE:
+    source: lexicons.hurtlex.categories.severe_abuse
+    augment: lexicons.ldnoobw
+    query_layer: { from_lexicon: true, max_terms_per_rule: 40 }
+    weight: 0.9
+
+  TARGETED_DEHUMANIZATION:
+    source: lexicons.hurtlex.categories.dehumanization
+    # Lexicon hit alone is not enough. Requires a second-person or named target
+    # in the same post, else it is commentary, quotation, or counter-speech.
+    requires_target: true
+    scoring_layer:
+      TARGET_PRESENT:
+        en: '(^|\s)(@\w+|you|u|ur|your|these people|those people)\b'
+        fr: '(^|\s)(@\w+|tu|toi|ton|ta|tes|vous|ces gens|ces gens-là)\b'
+    weight: 0.9
+
+# ---------------------------------------------------------------------------
+# C2 - Medium severity
+# ---------------------------------------------------------------------------
+C2:
+  tier: 2
+  severity: medium
+  description: Hostile tone, dismissive language, mild insults.
+
+  HOSTILE_ADJECTIVE:
+    en: [pathetic, clueless, incompetent, delusional, worthless, useless,
+         insufferable, unhinged, brainless, spineless, corrupt, fraudulent,
+         embarrassing, disgusting, creepy, pitiful, washed, illiterate, deranged]
+    fr: [pathétique, minable, nul, incompétent, ridicule, lamentable, débile,
+         inutile, prétentieux, insupportable, dérangé, corrompu, pitoyable]
+    requires_target: true
+    weight: 0.5
+
+  DISMISSIVE_PHRASE:
+    en: ["nobody asked", "who cares", "no one cares", "cope harder", "stay mad",
+         "touch grass", "sit down", "shut up", "delete your account", "log off",
+         "be serious", "you're irrelevant", "stay in your lane", "go back to"]
+    fr: ["personne t'a demandé", "on s'en fout", "tais-toi", "va te coucher",
+         "tu es qui toi", "arrête de parler", "ça n'intéresse personne",
+         "retourne dans ton pays", "casse-toi"]
+    weight: 0.5
+
+  MOCKING_TONE:
+    en: ["lmao imagine", "sure buddy", "ok genius", "this you", "the audacity",
+         "bless your heart", "L + ratio", "ratio", "found the", "peak comedy",
+         "big brain moment"]
+    fr: [mdr, ptdr, "bien sûr bien sûr", "quel génie", "trop fort le mec",
+         "ah oui vraiment", "tu me fais rire", "on est mort"]
+    weight: 0.4
+
+# ---------------------------------------------------------------------------
+# C3 - Ambiguous. This is the tier the panel exists for.
+# ---------------------------------------------------------------------------
+C3:
+  tier: 3
+  severity: ambiguous
+  description: >
+    Context-dependent. Never scored as harassment on match. A C3 hit routes the
+    post to the full judge panel and is logged as a disagreement candidate.
+  routing: force_full_panel
+
+  AMBIGUOUS_SLANG:
+    en: [destroy, kill, murdered, savage, toxic, trash, wreck, cooked, washed,
+         mid, npc, clown, ratio, brutal, insane, crazy, sick, wild, dying,
+         obsessed, canceled]
+    fr: [détruit, tuer, mort, sale, toxique, nul, cramé, grillé, fou, malade,
+         dingue, obsédé]
+    valence_flip_contexts: [gaming, sports, in_group_reclaimed, fandom]
+    weight: 0.0   # feature only, contributes no score
+
+  CODED_LANGUAGE:
+    en: [globalist, "those people", "you people", "we all know who",
+         "certain communities", "the usual suspects", "do the math",
+         "notice a pattern", "every single time"]
+    fr: ["mondialiste", "ces gens-là", "vous savez qui", "certaines communautés",
+         "comme par hasard", "grand remplacement"]
+    scoring_layer:
+      ECHO_BRACKETS: '\({3}.+?\){3}'
+    weight: 0.0
+
+  ALGOSPEAK:
+    en: [unalive, seggs, grape, "pdf file", "le$bian", corn, accountant,
+         "self delete", yeeted]
+    fr: [suicid€, "se f0utre", "n@zi"]
+    scoring_layer:
+      CHAR_SUBSTITUTION: '\b\w*[0-9@$!|]\w*[a-z]\w*\b'
+      VOWEL_DROPPING: '\b[bcdfghjklmnpqrstvwxz]{4,}\b'
+      ZERO_WIDTH: '[\u200B-\u200D\uFEFF\uFE0E\uFE0F]{2,}'
+    weight: 0.0
+
+  IRONY_MARKER:
+    en: ["/s", "sure jan", "obviously", "clearly", "great job",
+         "love that for you", "how brave", "so brave"]
+    fr: ["ironie", "bien sûr", "évidemment", "quel courage", "bravo hein"]
+    scoring_layer:
+      MOCKING_CASE: '\b(?=\w*[a-z])(?=\w*[A-Z])[a-zA-Z]{6,}\b'
+      SCARE_QUOTES: '["\u201C\u2018''](\w+\s?){1,3}["\u201D\u2019'']'
+      ELLIPSIS_EXCESS: '\.{4,}'
+    weight: 0.0
+
+# ---------------------------------------------------------------------------
+# C4 - Phrase templates, ACTION x TARGET
+# ---------------------------------------------------------------------------
+C4:
+  tier: 2
+  severity: structural
+  description: Structured harassment patterns. Cross-product, compiled as AND.
+
+  ACTION_ATTACK:
+    inflect: true
+    # Axis, not a signal. C4 scores only as ACTION x TARGET, never alone.
+    scores_alone: false
+    en: [attack, destroy, ruin, expose, dox, hunt, silence, eliminate,
+         "come for", "go after", "take down", hound, harass]
+    fr: [attaquer, détruire, ruiner, exposer, traquer, "faire taire",
+         "s'en prendre à", harceler]
+  ACTION_DISMISS:
+    inflect: true
+    # Axis, not a signal. C4 scores only as ACTION x TARGET, never alone.
+    scores_alone: false
+    en: [ignore, dismiss, discredit, belittle, undermine, patronize, gaslight,
+         "explain to", correct, educate]
+    fr: [ignorer, discréditer, rabaisser, "expliquer à", corriger, "remettre à sa place"]
+  ACTION_MOCK:
+    inflect: true
+    # Axis, not a signal. C4 scores only as ACTION x TARGET, never alone.
+    scores_alone: false
+    en: [mock, ridicule, "laugh at", meme, roast, drag, "clown on", "dunk on", troll]
+    fr: [moquer, ridiculiser, "se foutre de", clasher, "chambrer"]
+
+  TARGET_PUBLIC_FIGURE:
+    # An axis, not a signal. "senator" alone is a civic tweet, not harassment.
+    scores_alone: false
+    en: [journalist, reporter, "elected official", candidate, mayor, senator,
+         activist, moderator, researcher, athlete, streamer, creator]
+    fr: [journaliste, "élu", "élue", candidat, maire, "sénateur", "députée",
+         militant, chercheuse, streameur, "créatrice"]
+
+  TARGET_SOCIAL_GROUP:
+    # Intentionally NOT a match axis. Crossing attack verbs with identity terms
+    # is the best-documented source of false-positive bias in toxicity models
+    # (Dixon et al. 2018). Identity terms are used here only to MEASURE that
+    # bias, never to trigger a flag.
+    use: bias_evaluation_only
+    match: false
+    source: "Jigsaw identity terms (Dixon et al. 2018)"
+    url: "https://github.com/conversationai/unintended-ml-bias-analysis"
+    report: per_group_false_positive_rate
+
+  cross_product:
+    - [ACTION_ATTACK, TARGET_PUBLIC_FIGURE]
+    - [ACTION_DISMISS, TARGET_PUBLIC_FIGURE]
+    - [ACTION_MOCK, TARGET_PUBLIC_FIGURE]
+  weight: 0.6
+
+# ---------------------------------------------------------------------------
+# C5 - Emoji
+# ---------------------------------------------------------------------------
+C5:
+  tier: 2
+  severity: tone
+  description: Emoji tone and intent signals. Receiver-side filtering.
+
+  EMOJI_ANGER:
+    chars: ["\U0001F620", "\U0001F621", "\U0001F92C", "\U0001F47F",
+            "\U0001F4A2", "\U0001F624", "\U0001F595", "\U0001F63E"]
+    weight: 0.4
+  EMOJI_MOCKERY:
+    chars: ["\U0001F921", "\U0001F644", "\U0001F639", "\U0001F92A",
+            "\U0001FAF5", "\U0001F971", "\U0001F913", "\U0001F9E2",
+            "\U0001F4C9", "\U0001F44F"]
+    weight: 0.3
+  EMOJI_THREAT:
+    chars: ["\U0001F52A", "\U0001F52B", "\u2620\uFE0F", "\u26B0\uFE0F",
+            "\U0001FAA6", "\U0001FA78", "\U0001F9E8", "\U0001F4A3",
+            "\U0001F3AF", "\U0001F40D"]
+    weight: 0.8
+  EMOJI_CODED:
+    chars: ["\U0001F438", "\U0001F95B", "\U0001F44C", "\U0001F53A"]
+    routing: force_full_panel
+    weight: 0.0
+  EMOJI_AMBIGUOUS:
+    # Benign usage dominates for both. Routed to C3, not scored as tone.
+    chars: ["\U0001F480", "\U0001F602", "\U0001F923"]
+    reroute_to: C3
+    weight: 0.0
+
+  modifiers:
+    REPETITION:
+      description: Same emoji 3+ times in one post. Pile-on marker.
+      min_count: 3
+      multiplier: 1.5
+    REPLY_CHAIN_POSITION:
+      description: Weight higher in a reply or quote than in an original post.
+      multipliers: { original: 1.0, reply: 1.3, quote: 1.4 }
+    SKIN_TONE_IN_REPLY:
+      description: Skin-tone modifier applied in a reply to an identified user.
+      routing: force_full_panel
+
+# ---------------------------------------------------------------------------
+# Normalization. Runs before every scoring_layer regex. Skipping this silently
+# breaks ALGOSPEAK and every evasion case.
+# ---------------------------------------------------------------------------
+normalization:
+  unicode_form: NFKC
+  strip_zero_width: true          # U+200B..U+200D, U+FEFF
+  strip_variation_selectors: true # U+FE0E, U+FE0F (after emoji matching)
+  fold_homoglyphs: true           # Cyrillic/Greek lookalikes -> Latin
+  collapse_repeats: 3             # "loooool" -> "loool", preserve the signal
+  casefold: true
+  preserve_original: true         # keep raw text; judges see the raw
+
+# ---------------------------------------------------------------------------
+# Anchors. Every X API v2 query needs at least one STANDALONE operator.
+# is:reply, is:retweet, has:*, and lang: are all conjunction-required and are
+# rejected on their own. Streams that carry no lexicon still need an anchor,
+# and it must be lexicon-free so the stream stays unsteered.
+#
+# @mention and to: are standalone, so a roster of civic accounts anchors the
+# query without introducing any harassment vocabulary. Note the consequence for
+# the paper: prevalence measured this way is prevalence among posts directed at
+# these accounts, not among French Twitter at large. Document the roster.
+# ---------------------------------------------------------------------------
+anchors:
+  civic_accounts:
+    description: Elected officials, XVIIe legislature.
+    source: https://www2.assemblee-nationale.fr/deputes/liste/reseaux-sociaux
+    method: seeded random sample (seed=42, n=20) of the 362 deputies listing a
+      usable X account; 1 entry rejected as malformed. 362 of 577 deputies list
+      an account at all, so reply-directed collection cannot reach the other 37%.
+    note: >
+      Do not add accounts by hand. Sampling by prominence biases the roster
+      toward the most-harassed accounts and inflates the prevalence estimate,
+      which is the independent variable in this design.
+    handles: [Vspillebout, FabriceBrun, erwanbalanant, F_Gernigon, FerracciMarc,
+              stelladupont, jrcazeneuve, LouisBoyard, Vt_Trebuchet, jfportarrieu,
+              BonnivardE, claudia_rouaux, DelphLingemann, michelbarnier, ChrisBapt,
+              AntBoulogne54, Peioizate, Au_Evrard, JulienOdoul, Francois_Ruffin]
+    form: mention
+
+  media_accounts:
+    description: News organisations. A different population from individuals.
+    note: >
+      Not drawn from any registry. Keep separate from civic_accounts: replies to
+      an outlet argue with the story, replies to a person can target the person.
+    handles: [lemondefr, libe, mediapart, franceinfo, AFP]
+    form: mention
+  neutral_topics:
+    description: >
+      Non-civic subjects for the baseline stream. Bare keywords are standalone
+      operators, so this stream never required an account anchor. Anchoring it
+      on the deputy roster replaced its population with stream A's and produced
+      a "neutral" baseline that scored 40.8% harassment, above the
+      lexicon-seeded stream. Single words only: the anchor group is not quoted.
+    tags: [recette, cuisine, patisserie, restaurant, meteo, orage, canicule,
+           SNCF, RER, trafic, film, serie, concert, exposition, jardin,
+           bricolage, livre, roman, vacances, randonnee, teletravail, marathon]
+
+  civic_hashtags:
+    description: Standalone hashtag anchor for topic sampling.
+    tags: ["#DirectAN", "#QAG", "#politique"]                # placeholder
+
+# ---------------------------------------------------------------------------
+# Collection streams. Maps to the four labeled streams of the 2026 collection.
+# ---------------------------------------------------------------------------
+streams:
+  A_reply_directed:
+    operators: ["is:reply", "-is:retweet"]
+    anchor: civic_accounts
+    anchor_form: reply_to
+    filters: []
+    note: >
+      Structural stream, no lexicon seeding. The to: roster is the standalone
+      operator the API requires; it carries no harassment vocabulary.
+  B_topic:
+    operators: ["-is:retweet"]
+    anchor: civic_hashtags
+    filters: []
+    note: >
+      Topic terms supplied per round at runtime and merged with the anchor.
+      Runtime terms are standalone keywords, so they satisfy the requirement
+      on their own once supplied.
+  C_lexicon_seeded:
+    operators: ["-is:retweet"]
+    filters: [C1, C2, C4, C5]
+    note: The only stream that uses these sets for retrieval.
+  D_neutral_baseline:
+    operators: ["-is:retweet", "-has:links", "-is:reply"]
+    anchor: neutral_topics
+    filters: []
+    negate: [C1, C2, C4, C5]
+    note: >
+      Prevalence anchor. Two corrections after round 1, both from the same
+      defect: this stream was anchored on the civic_accounts roster to satisfy
+      the standalone-operator rule, which it already satisfied through its own
+      topic keywords. The result was stream A under a different label -- replies
+      to the same deputies, minus about 25 lexicon terms -- and a baseline that
+      scored 40.8% harassment against 29.0% for the lexicon-seeded stream.
+      -is:reply is now explicit so A and D cannot overlap even if an account
+      anchor is ever reintroduced. Round 1 D data (1,207 rows) is invalid and
+      must be excluded from every figure.
+
+# ---------------------------------------------------------------------------
+# X API v2 compilation budget
+# ---------------------------------------------------------------------------
+api:
+  provider: x_v2
+  endpoint: tweets/search/recent
+  query_char_limit: 512      # 1024 on Pro, 4096 on Enterprise. Raise if entitled.
+  reserve_chars: 64          # room for lang:, -is:retweet, time operators
+  max_rules: 25
+  chunk_strategy: greedy_by_weight
+  always_append: ["lang:{locale}", "-is:retweet"]
+
+# ---------------------------------------------------------------------------
+notes:
+  tier_semantics: >
+    C1 may act as a standalone high-precision flag only for EXPLICIT_THREAT
+    structural matches. Every other tier is a feature into the five-judge panel
+    vote (k>=3 of 5). A lexicon hit is evidence, not a verdict. This is the same
+    separation Paper 1 documents: recording a heuristic as an answer is the
+    defect, not the shortcut.
+  false_positive_watch: >
+    Counter-speech is the known failure mode. Posts denouncing racism, sexism,
+    or femicide coverage match C1 and C3 heavily and are not harassment. Track
+    them explicitly in the eval set.
+  abstain: >
+    Filter layers never abstain. Only judges do. A no-match is a real zero.

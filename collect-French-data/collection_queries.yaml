@@ -1,0 +1,253 @@
+# French civic collection queries for X API v2 (recent search)
+#
+# Four streams. Each row stored with its stream label so sampling design is
+# auditable and per-stream prevalence can be reported separately.
+#
+# BILLING: you pay per post RETURNED, not per query. Retrieve broadly once,
+# store raw, filter offline. Never re-collect to refine a filter.
+#
+# PREVALENCE: streams A and C are enriched and will over-represent harassment.
+# Report per-stream rates separately. Any corpus-level prevalence claim must
+# come from streams B and D only, or be explicitly reweighted.
+
+defaults:
+  # Applied to every query unless overridden.
+  operators: "lang:fr -is:retweet"
+  tweet_fields:
+    - id
+    - text
+    - created_at
+    - author_id
+    - conversation_id
+    - in_reply_to_user_id
+    - referenced_tweets
+    - possibly_sensitive        # REQUIRED or the field returns absent, not false
+    - public_metrics
+    - entities
+    - attachments
+  expansions:
+    - attachments.media_keys
+    - author_id
+    - referenced_tweets.id
+  media_fields:
+    - media_key
+    - type                       # photo | video | animated_gif
+    - url                        # photo only
+    - preview_image_url
+    - variants                   # video bitrate variants -- download highest
+    - duration_ms
+    - alt_text
+  user_fields:
+    - id
+    - public_metrics
+    - verified
+
+  # Download media at capture time. Archived URLs expire; this is the failure
+  # that made Gemini Vision abstain on 100% of the previous evaluation stream.
+  download_media: true
+  media_store: gs://YOUR-BUCKET/media/fr/
+
+# ---------------------------------------------------------------------------
+# STREAM A — reply-directed.  Target 40% of the labelled sample.
+# Where directed harassment actually occurs. Matches the receiver-side framing
+# of the patent and the construction used by piuba-bigdata for Argentine Spanish.
+# ---------------------------------------------------------------------------
+stream_a_reply_directed:
+  share: 0.40
+  method: |
+    Build a handle list, then query replies to those accounts. Do not use
+    mentions -- that returns quote-tweets and third-party discussion. Use
+    to:HANDLE, or conversation_id when you want a full thread.
+
+    Query shape:
+      (to:HANDLE1 OR to:HANDLE2 OR to:HANDLE3) lang:fr -is:retweet
+
+    Batch 8-10 handles per query. More than that and the query string gets
+    unwieldy and you lose track of which handle produced which rows.
+
+  # Do not hardcode individuals. Build the list from these categories, refresh
+  # monthly, and store the handle with every row so you can audit and, if a
+  # single account dominates, downsample it.
+  account_categories:
+    - label: national_politicians
+      note: >
+        Deputies and senators active on X, across the full political spectrum.
+        Balance left/centre/right deliberately -- a skewed list produces a
+        corpus that learns partisan direction rather than abuse.
+      source: Assemblée nationale and Sénat member directories
+
+    - label: local_officials
+      note: >
+        Mayors and regional councillors. Lower follower counts, less bot
+        activity, more organic local hostility. Under-represented in every
+        published corpus.
+
+    - label: journalists
+      note: >
+        Political and investigative reporters at national outlets. Reliably
+        receive sustained public criticism, some of it abusive.
+
+    - label: women_in_public_life
+      note: >
+        Explicitly sampled: gendered harassment is a distinct register and
+        the largest single target category in most French corpora.
+
+    - label: minority_public_figures
+      note: >
+        Racialised and religious-minority figures in politics, media and sport.
+        Where the most severe abuse concentrates.
+
+    - label: sports_figures
+      note: >
+        Footballers and national-team players. High-volume, high-emotion,
+        and a well-documented racial abuse vector after matches.
+
+    - label: activists_ngos
+      note: >
+        Climate, anti-racism, LGBTQ+ and feminist organisations. Receive
+        coordinated hostility during news cycles.
+
+  timing: |
+    Collect within 24-48h of a news event involving a listed account. Abuse
+    is bursty; a quiet-period sample under-represents it substantially.
+    2027 presidential campaign season is beginning -- volume will rise.
+
+# ---------------------------------------------------------------------------
+# STREAM B — topic-based.  Target 30%.
+# Captures abusive AND non-abusive speech on the same contested subject.
+# This is the stream that distinguishes over-blocking from correct filtering,
+# and the one your DSA argument depends on.
+# ---------------------------------------------------------------------------
+stream_b_topic:
+  share: 0.30
+  note: >
+    Do not filter these for abuse. The point is that civil and abusive speech
+    coexist on identical topics. A classifier that flags the topic rather than
+    the abuse fails here, and that failure is the finding.
+
+  queries:
+    - "(laïcité OR voile OR burkini OR séparatisme) lang:fr -is:retweet"
+    - "(immigration OR migrants OR sans-papiers OR OQTF OR frontières) lang:fr -is:retweet"
+    - "(insécurité OR délinquance OR police OR bavure OR IGPN) lang:fr -is:retweet"
+    - "(retraites OR réforme OR grève OR syndicat OR 49.3) lang:fr -is:retweet"
+    - "(écologie OR climat OR ZFE OR nucléaire OR agriculteurs) lang:fr -is:retweet"
+    - "(féminisme OR sexisme OR MeToo OR violences conjugales) lang:fr -is:retweet"
+    - "(LGBT OR transphobie OR homophobie OR PMA) lang:fr -is:retweet"
+    - "(antisémitisme OR islamophobie OR racisme OR discrimination) lang:fr -is:retweet"
+    - "(banlieue OR quartiers OR ZEP OR mixité sociale) lang:fr -is:retweet"
+    - "(chômage OR RSA OR assistanat OR pouvoir d'achat) lang:fr -is:retweet"
+    - "(hôpital OR santé OR déserts médicaux) lang:fr -is:retweet"
+    - "(école OR enseignants OR harcèlement scolaire) lang:fr -is:retweet"
+
+  hashtags: |
+    Refresh monthly from trending French political tags. Static hashtag lists
+    go stale within weeks. Candidates as of collection start:
+      #DirectAN #QAG #PLF2027 #Presidentielle2027 #Municipales
+      #JeSuisPour #JeSuisContre #StopVFF #BalanceTonPorc
+
+# ---------------------------------------------------------------------------
+# STREAM C — lexicon-seeded.  Target 20%, capped deliberately.
+# High-precision positives. Bounded so it does not dominate: a lexicon-seeded
+# corpus has poor recall for implicit and coded abuse -- exactly the CAG class
+# your own data shows is hardest -- and produces a test set that flatters
+# keyword baselines.
+# ---------------------------------------------------------------------------
+stream_c_lexicon:
+  share: 0.20
+  note: >
+    Seed terms come from resources you already hold. Do not assemble a new
+    slur list; use the five bag-of-words sets described in US 2021/0157872 A1
+    and the French entries in Hatebase, which the patent already cites.
+
+  sets_to_use:
+    - set_1_hardcore: "explicit terms. Highest precision, lowest recall."
+    - set_2_milder: "pejorative but not slurs. Better recall, needs context."
+    - set_3_double_meaning: >
+        terms abusive in one sense and ordinary in another. THE MOST USEFUL
+        SET for this study -- it is where a keyword filter and a classifier
+        diverge most visibly, and where over-blocking originates.
+    - set_4_phrase_templates: >
+        bad-action + target constructions. Query as proximity pairs rather
+        than single tokens: one action term AND one target term in the same
+        post. Catches composed abuse that single-token search misses.
+    - set_5_emoji: >
+        emoji sequences used as coded abuse. Query directly -- these evade
+        text-based moderation and are under-collected everywhere.
+
+  construction: |
+    Batch 6-10 terms per query with OR. Keep set membership on every row so
+    per-set precision can be reported.
+      (TERM1 OR TERM2 OR TERM3) lang:fr -is:retweet
+
+    For set 4, proximity form:
+      (ACTION1 OR ACTION2) (TARGET1 OR TARGET2) lang:fr -is:retweet
+
+  caution: >
+    Expect this stream to be 30-60% positive. Never merge its rate into a
+    corpus-level prevalence figure. Report it separately.
+
+# ---------------------------------------------------------------------------
+# STREAM D — neutral baseline.  Target 10%.
+# Negative-class realism. Without it the evaluation set is out-of-topic
+# rather than out-of-domain, and precision estimates are meaningless.
+# ---------------------------------------------------------------------------
+stream_d_neutral:
+  share: 0.10
+  queries:
+    - "(recette OR cuisine OR pâtisserie OR restaurant) lang:fr -is:retweet"
+    - "(météo OR canicule OR orage OR neige) lang:fr -is:retweet"
+    - "(transports OR SNCF OR RER OR métro OR retard) lang:fr -is:retweet"
+    - "(cinéma OR série OR festival OR concert) lang:fr -is:retweet"
+    - "(jardinage OR bricolage OR déco) lang:fr -is:retweet"
+    - "(lecture OR roman OR librairie) lang:fr -is:retweet"
+    - "(voyage OR vacances OR randonnée) lang:fr -is:retweet"
+    - "(examens OR bac OR parcoursup OR rentrée) lang:fr -is:retweet"
+    - "(télétravail OR bureau OR entretien embauche) lang:fr -is:retweet"
+    - "(match OR score OR ligue1 OR championnat) lang:fr -is:retweet"
+
+# ---------------------------------------------------------------------------
+# MEDIA SUB-STREAM — cross-cuts A through D.
+# Gemini Vision abstained on 100% of the previous evaluation stream because
+# archived media links no longer resolved. Live capture fixes this.
+# ---------------------------------------------------------------------------
+media_substream:
+  note: >
+    Add has:media to any query above to enrich for image- and video-bearing
+    posts. Run as a parallel pass rather than replacing the base queries --
+    media-bearing posts are a minority and you want both populations.
+  operator_suffix: "has:media"
+  target: "at least 2,000 media-bearing posts across all four streams"
+  download: |
+    Download bytes at capture time, not URLs. For video, take the highest
+    bitrate entry in media.variants. Store the media_key alongside the
+    tweet_id so Vision output joins back cleanly.
+
+# ---------------------------------------------------------------------------
+# OFFLINE FILTERING — runs on stored data, costs nothing, iterate freely
+# ---------------------------------------------------------------------------
+offline_filters:
+  - independent_language_detection: >
+      X's lang:fr is imperfect. Verify with fasttext or langdetect. Expect
+      5-10% loss, mostly Occitan, Corsican, Haitian Creole and code-switched
+      French-Arabic. Do not discard code-switched rows -- flag them. They are
+      exactly the sociolinguistic variation your Limitations section names.
+  - deduplicate: "normalised text key, same rule as the corpus builder"
+  - min_length: "5 characters after normalisation"
+  - bot_heuristics: >
+      Drop accounts posting identical text repeatedly. Keep the count -- an
+      automated-abuse rate is worth reporting.
+  - strip_pii: "replace @mentions with @user, URLs with @url, per corpus convention"
+
+# ---------------------------------------------------------------------------
+# CHECKS FOR THE $25 PILOT — run before committing the full budget
+# ---------------------------------------------------------------------------
+pilot_checks:
+  - "keep-rate per stream: usable rows / posts returned. Sets the real cost."
+  - >
+      possibly_sensitive: is the FIELD being returned at all? If every row
+      shows absent rather than false, the tweet_fields parameter is missing
+      and the 0% rate in the previous evaluation was a request bug, not a
+      platform property. Five-minute check, changes the interpretation entirely.
+  - "media resolution: does a downloaded video actually play?"
+  - "language precision: what fraction of lang:fr survives independent detection?"
+  - "per-stream positive rate: a rough hand-check of 50 rows per stream."
